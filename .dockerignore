@@ -1,0 +1,8 @@
+.env
+.git
+.gitignore
+web/node_modules
+__pycache__
+*.pyc
+*.bin
+chat.db

@@ -541,6 +541,85 @@ class OutlookGraphClient:
                 results["failed"].append({"id": email_id, "error": str(e)})
         return results
 
+    # ==============================
+    # Calendar
+    # ==============================
+    def calendar_get_upcoming_events(self, *, top: int = 10, days_ahead: int = 7) -> List[Dict[str, Any]]:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        end = now + timedelta(days=days_ahead)
+        data = self._request(
+            "GET",
+            "/me/calendarView",
+            params={
+                "$top": top,
+                "$select": "id,subject,start,end,organizer,attendees,isAllDay,location,bodyPreview,importance",
+                "$orderby": "start/dateTime",
+                "startDateTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        return list(data.get("value", []))
+
+    def calendar_get_today_events(self) -> List[Dict[str, Any]]:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        data = self._request(
+            "GET",
+            "/me/calendarView",
+            params={
+                "$top": 20,
+                "$select": "id,subject,start,end,organizer,attendees,isAllDay,location,bodyPreview",
+                "$orderby": "start/dateTime",
+                "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        return list(data.get("value", []))
+
+    def calendar_create_event(
+        self,
+        *,
+        subject: str,
+        start_datetime: str,
+        end_datetime: str,
+        attendees: Optional[List[str]] = None,
+        body: Optional[str] = None,
+        location: Optional[str] = None,
+        is_all_day: bool = False,
+        timezone_str: str = "UTC",
+    ) -> Dict[str, Any]:
+        event: Dict[str, Any] = {
+            "subject": subject,
+            "start": {"dateTime": start_datetime, "timeZone": timezone_str},
+            "end": {"dateTime": end_datetime, "timeZone": timezone_str},
+            "isAllDay": is_all_day,
+        }
+        if attendees:
+            event["attendees"] = [
+                {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+            ]
+        if body:
+            event["body"] = {"contentType": "Text", "content": body}
+        if location:
+            event["location"] = {"displayName": location}
+        return self._request("POST", "/me/events", json=event)
+
+    def calendar_search_events(self, query: str, *, top: int = 10) -> List[Dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/me/events",
+            params={
+                "$search": f'"{query}"',
+                "$top": top,
+                "$select": "id,subject,start,end,organizer,attendees,isAllDay,location,bodyPreview",
+            },
+            headers={"ConsistencyLevel": "eventual"},
+        )
+        return list(data.get("value", []))
+
     def outlook_move_emails(
         self, email_ids: Iterable[str], *, folder_name: str, allow_bulk: bool = False
     ) -> Dict[str, Any]:

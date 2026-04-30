@@ -136,6 +136,11 @@ def get_outlook_tools(
         "auto_archive_promotions": lambda *, emails: auto_archive_promotions(llm, emails=emails),
         "auto_reply_rules": lambda *, emails, rule: auto_reply_rules(llm, emails=emails, rule=rule),
         "outlook_tool_stats": lambda: GLOBAL_STATS.snapshot(),
+        # Calendar tools
+        "calendar_get_upcoming_events": core.calendar_get_upcoming_events,
+        "calendar_get_today_events": core.calendar_get_today_events,
+        "calendar_create_event": core.calendar_create_event,
+        "calendar_search_events": core.calendar_search_events,
     }
 
     # Standardize outputs + add logging/stats

@@ -413,6 +413,66 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    # ── Calendar ──────────────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_get_upcoming_events",
+            "description": "Get upcoming calendar events for the next N days.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top": {"type": "integer", "description": "Max number of events to return (default 10)."},
+                    "days_ahead": {"type": "integer", "description": "How many days ahead to look (default 7)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_get_today_events",
+            "description": "Get all calendar events scheduled for today.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_create_event",
+            "description": "Create a new calendar event / meeting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "Event title."},
+                    "start_datetime": {"type": "string", "description": "Start time in ISO-8601 UTC, e.g. 2026-05-01T10:00:00."},
+                    "end_datetime": {"type": "string", "description": "End time in ISO-8601 UTC, e.g. 2026-05-01T11:00:00."},
+                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "Optional list of attendee email addresses."},
+                    "body": {"type": "string", "description": "Optional event description."},
+                    "location": {"type": "string", "description": "Optional location or meeting link."},
+                    "is_all_day": {"type": "boolean", "description": "True if this is an all-day event."},
+                    "timezone_str": {"type": "string", "description": "Timezone name, e.g. 'Asia/Kolkata' or 'UTC' (default UTC)."},
+                },
+                "required": ["subject", "start_datetime", "end_datetime"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calendar_search_events",
+            "description": "Search calendar events by keyword in the subject or body.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keyword."},
+                    "top": {"type": "integer", "description": "Max results (default 10)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     # ── V2 (ID-free / NL helpers) ─────────────────────────────────────────────
     {
         "type": "function",
