@@ -196,6 +196,150 @@ def summarize_emails(llm: LMStudioClient, *, emails: List[Dict[str, str]]) -> st
     )
 
 
+def _graph_message_to_snippet(m: Dict[str, Any]) -> Dict[str, str]:
+    """Turn a Graph message dict into a small text bundle for the LLM."""
+    from_addr = (m.get("from") or {}).get("emailAddress") or {}
+    name = (from_addr.get("name") or "").strip()
+    addr = (from_addr.get("address") or "").strip()
+    if name and addr:
+        sender = f"{name} <{addr}>"
+    else:
+        sender = addr or name or "?"
+    prev = (m.get("bodyPreview") or "").strip()
+    if not prev:
+        body = m.get("body")
+        if isinstance(body, dict):
+            prev = (body.get("content") or "").strip()[:8000]
+    return {
+        "subject": (m.get("subject") or "(no subject)").strip(),
+        "sender": sender,
+        "preview": prev[:8000],
+        "id": str(m.get("id") or ""),
+    }
+
+
+def _emails_from_tool_result(obj: Any) -> List[Dict[str, Any]]:
+    if isinstance(obj, list):
+        return list(obj)
+    if isinstance(obj, dict):
+        return list(obj.get("emails") or [])
+    return []
+
+
+def _collect_messages_for_summarize(core: Any, user_query: str, max_emails: int) -> List[Dict[str, Any]]:
+    """
+    Pick a sensible slice of the mailbox for summarization from free-text intent.
+    Uses simple substring checks only (no regex).
+    """
+    low = user_query.lower()
+
+    if "unread" in low:
+        r = core.outlook_get_unread_emails(page_size=max_emails)
+        got = _emails_from_tool_result(r)
+        if got:
+            return got[:max_emails]
+
+    if "flag" in low or "starred" in low:
+        r = core.outlook_get_flagged_emails(page_size=max_emails)
+        got = _emails_from_tool_result(r)
+        if got:
+            return got[:max_emails]
+
+    broad_phrases = (
+        "summarize my inbox",
+        "summary of my inbox",
+        "my inbox",
+        "entire inbox",
+        "whole inbox",
+        "all my email",
+        "all my emails",
+        "all my mail",
+        "catch me up",
+        "summarize everything",
+        "email overview",
+        "mail overview",
+        "what's new",
+        "whats new",
+        "recent mail",
+        "recent emails",
+        "latest mail",
+        "latest emails",
+    )
+    if any(p in low for p in broad_phrases):
+        r = core.outlook_get_emails(page_size=max_emails)
+        got = _emails_from_tool_result(r)
+        if got:
+            return got[:max_emails]
+
+    r = core.outlook_find_messages(user_query, page_size=max_emails)
+    got = _emails_from_tool_result(r)
+    if got:
+        return got[:max_emails]
+    r2 = core.outlook_get_emails(page_size=max_emails)
+    return _emails_from_tool_result(r2)[:max_emails]
+
+
+def summarize_mailbox(
+    llm: LMStudioClient,
+    core: Any,
+    *,
+    query: str,
+    max_emails: int = 15,
+    email_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    One-shot summarization from natural language: recent inbox, unread, flagged,
+    sender/topic-focused (delegates to the same discovery path as mail search), or a single message by id.
+    """
+    cap = max(1, min(25, int(max_emails or 15)))
+    q = (query or "").strip() or "Summarize my recent mailbox."
+    eid = (email_id or "").strip()
+
+    if eid:
+        msg = core.outlook_get_email_by_id(eid)
+        snippets = [_graph_message_to_snippet(msg)]
+        n = 1
+    else:
+        raw = _collect_messages_for_summarize(core, q, cap)
+        snippets = [_graph_message_to_snippet(m) for m in raw]
+        n = len(snippets)
+
+    if not snippets:
+        return {"summary": "No messages were found to summarize.", "email_count": 0}
+
+    blocks: List[str] = []
+    for i, s in enumerate(snippets, start=1):
+        sid = s.get("id") or ""
+        short_id = (sid[:20] + "…") if len(sid) > 20 else sid
+        blocks.append(
+            f"--- Message {i} (id={short_id})\n"
+            f"From: {s['sender']}\nSubject: {s['subject']}\nPreview:\n{s['preview']}\n"
+        )
+    body = "\n".join(blocks)
+    max_ctx = 14000
+    if len(body) > max_ctx:
+        body = body[:max_ctx] + "\n… (content truncated for the model context limit)"
+
+    user_block = f"The user asked:\n{q}\n\nHere are the messages:\n{body}"
+    summary = llm.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are an intelligent mailbox assistant (similar in spirit to inbox briefing tools). "
+                    "The user described what they want in their own words — follow that intent: summarize, "
+                    "prioritize, extract themes, compare threads, surface deadlines or action items, or give a "
+                    "brief overview. Use only the excerpts provided; never invent messages or senders not shown. "
+                    "If the excerpts do not match their request, say so briefly."
+                ),
+            },
+            {"role": "user", "content": user_block},
+        ],
+        temperature=0.3,
+    )
+    return {"summary": summary, "email_count": n}
+
+
 def auto_categorize_emails(llm: LMStudioClient, *, emails: List[Dict[str, str]]) -> str:
     content = "\n\n".join([f"[{i+1}] Subject: {e.get('subject')}\nPreview: {e.get('preview')}" for i, e in enumerate(emails)])
     return llm.chat(

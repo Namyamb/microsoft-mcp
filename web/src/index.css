@@ -413,11 +413,70 @@ html, body, #root {
 .msg-bubble.assistant ul { padding-left: 1.4rem; margin: .35rem 0; }
 .msg-bubble.assistant li { margin: .2rem 0; }
 
+/* ── ID chips inside assistant messages ──────────────────────────────────── */
+.msg-id-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  max-width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: .1em .45em .1em .45em;
+  vertical-align: middle;
+  overflow: hidden;
+}
+.msg-id-text {
+  font-family: 'SF Mono','Cascadia Code','Consolas',monospace;
+  font-size: .75rem;
+  color: var(--text-muted);
+  word-break: break-all;
+  white-space: normal;
+  max-width: calc(100% - 24px);
+}
+.msg-id-copy {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+  transition: color .15s, background .15s;
+}
+.msg-id-copy:hover { background: rgba(99,102,241,.15); color: var(--primary); }
+.msg-id-copy.copied { color: var(--success); }
+.msg-id-copy.copied svg { animation: pop .2s ease; }
+@keyframes pop { 0%,100%{transform:scale(1)} 50%{transform:scale(1.35)} }
+
 .msg-bubble.typing { display: flex; align-items: center; gap: .3rem; }
 .typing-dot { width: 7px; height: 7px; background: var(--text-muted); border-radius: 50%; animation: bounce .9s ease-in-out infinite; }
 .typing-dot:nth-child(2) { animation-delay: .15s; }
 .typing-dot:nth-child(3) { animation-delay: .3s; }
 @keyframes bounce { 0%,60%,100% { transform:translateY(0); } 30% { transform:translateY(-5px); } }
+
+/* Stopped generation — muted footer like ChatGPT */
+.msg-stopped {
+  display: flex;
+  align-items: flex-start;
+  gap: .45rem;
+  margin-top: .15rem;
+  padding: .45rem .65rem;
+  max-width: 100%;
+  font-size: .78rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  border-left: 2px solid rgba(148, 163, 184, .45);
+  background: rgba(148, 163, 184, .06);
+  border-radius: 0 6px 6px 0;
+}
+.msg-stopped-icon { flex-shrink: 0; opacity: .75; font-size: .85rem; }
+.msg-stopped-text { flex: 1; }
 
 /* ── Tool Call Badges ─────────────────────────────────────────────────────── */
 .tool-calls { display: flex; flex-direction: column; gap: .35rem; }
@@ -515,6 +574,24 @@ html, body, #root {
 .send-btn:active:not(:disabled) { transform: scale(.95); }
 .send-btn:disabled { opacity: .4; cursor: not-allowed; }
 .send-btn svg { width: 18px; height: 18px; }
+
+.stop-btn {
+  min-width: 72px;
+  height: 44px;
+  padding: 0 1rem;
+  font-size: .88rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background .15s, border-color .15s, transform .1s;
+}
+.stop-btn:hover { background: rgba(239, 68, 68, .08); border-color: rgba(239, 68, 68, .45); color: var(--error); }
+.stop-btn:active { transform: scale(.97); }
 
 .send-spinner { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.3); border-top-color: white; border-radius: 50%; animation: spin .6s linear infinite; }
 .input-hint { font-size: .72rem; color: var(--text-dim); margin-top: .45rem; text-align: center; }

@@ -1,3 +1,4 @@
+import { useRef, useCallback } from 'react'
 import ToolCallBadge from './ToolCallBadge'
 import EmailCard from './EmailCard'
 
@@ -21,9 +22,25 @@ function extractEmailsFromResult(result) {
   return null
 }
 
+// Graph message IDs: base64url, 40+ chars, no spaces
+const ID_RE = /([A-Za-z0-9+/=_\-]{40,})/g
+
+function wrapIds(html) {
+  // Only replace outside of HTML tags by splitting on < > boundaries.
+  return html.replace(/>([^<]+)</g, (_, text) => {
+    const replaced = text.replace(ID_RE, id =>
+      `<span class="msg-id-chip" data-copy="${escapeHtml(id)}">`
+      + `<span class="msg-id-text">${escapeHtml(id)}</span>`
+      + `<button class="msg-id-copy" data-copy="${escapeHtml(id)}" title="Copy ID">`
+      + `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" width="12" height="12"><rect x="5" y="5" width="8" height="9" rx="1.5"/><path d="M3 11V3a1.5 1.5 0 0 1 1.5-1.5H11"/></svg>`
+      + `</button></span>`
+    )
+    return `>${replaced}<`
+  })
+}
+
 function renderMarkdown(text) {
-  // Simple markdown: bold, italic, code, line breaks, bullet lists
-  return text
+  const base = text
     .replace(/```[\s\S]*?```/g, m => `<pre><code>${escapeHtml(m.slice(3, -3))}</code></pre>`)
     .replace(/`([^`]+)`/g, (_, c) => `<code>${escapeHtml(c)}</code>`)
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
@@ -35,6 +52,7 @@ function renderMarkdown(text) {
     .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
     .replace(/\n\n/g, '</p><p>')
     .replace(/\n/g, '<br/>')
+  return wrapIds(base)
 }
 
 function escapeHtml(str) {
@@ -45,7 +63,19 @@ function escapeHtml(str) {
 }
 
 export default function MessageBubble({ message }) {
-  const { role, content, toolCalls, streaming } = message
+  const { role, content, toolCalls, streaming, stopped } = message
+  const bubbleRef = useRef(null)
+
+  const handleBubbleClick = useCallback((e) => {
+    const btn = e.target.closest('.msg-id-copy')
+    if (!btn) return
+    const id = btn.dataset.copy
+    if (!id) return
+    navigator.clipboard.writeText(id).then(() => {
+      btn.classList.add('copied')
+      setTimeout(() => btn.classList.remove('copied'), 1800)
+    })
+  }, [])
 
   if (role === 'user') {
     return (
@@ -100,7 +130,9 @@ export default function MessageBubble({ message }) {
         {/* Text content */}
         {content && (
           <div
+            ref={bubbleRef}
             className="msg-bubble assistant"
+            onClick={handleBubbleClick}
             dangerouslySetInnerHTML={{ __html: '<p>' + renderMarkdown(content) + '</p>' }}
           />
         )}
@@ -111,6 +143,18 @@ export default function MessageBubble({ message }) {
             <span className="typing-dot" />
             <span className="typing-dot" />
             <span className="typing-dot" />
+          </div>
+        )}
+
+        {/* User stopped generation — ChatGPT-style muted notice (not inline markdown) */}
+        {stopped && (
+          <div className="msg-stopped" role="status">
+            <span className="msg-stopped-icon" aria-hidden>⏹</span>
+            <span className="msg-stopped-text">
+              {content?.trim()
+                ? 'Generation stopped. The reply above is partial.'
+                : 'Generation stopped before any reply was produced.'}
+            </span>
           </div>
         )}
       </div>

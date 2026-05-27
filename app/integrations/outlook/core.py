@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import requests
 from msal import PublicClientApplication, SerializableTokenCache
@@ -27,6 +28,176 @@ from .utils import (
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 DEFAULT_AUTHORITY = "https://login.microsoftonline.com/common"
 DEFAULT_SCOPES = ["Mail.Read", "Mail.Send", "User.Read"]
+
+
+def _sanitize_mail_search_term(term: str) -> str:
+    """Normalize user/LLM-provided search text for Graph $search (KQL). Not a strict email check."""
+    t = (term or "").strip()
+    if not t:
+        raise EmailValidationError("Sender search term cannot be empty.")
+    t = " ".join(t.split())
+    if len(t) > 200:
+        t = t[:200]
+    for bad in "\n\r\t":
+        t = t.replace(bad, " ")
+    return t.replace('"', "")
+
+
+def _message_from_matches(msg: Dict[str, Any], needle: str) -> bool:
+    """True if From address or display name plausibly matches a free-text hint (no strict email)."""
+    n = needle.lower().strip()
+    if not n:
+        return False
+    fa = (msg.get("from") or {}).get("emailAddress") or {}
+    addr = (fa.get("address") or "").lower()
+    name = (fa.get("name") or "").lower()
+    if n in addr or n in name:
+        return True
+    if "@" in addr:
+        domain = addr.split("@", 1)[1]
+        if n in domain:
+            return True
+        # "amazon.com" → also match @amazon.co.uk, @m.amazon.com via first label
+        brand = n.split("@", 1)[0]
+        if "." in brand:
+            head = brand.split(".", 1)[0]
+            if len(head) >= 3 and head in domain:
+                return True
+    return False
+
+
+_BOGUS_SENDER_HINTS = frozenset(
+    {
+        "yesterday",
+        "today",
+        "tomorrow",
+        "last week",
+        "this week",
+        "next week",
+        "last month",
+        "this month",
+        "me",
+        "you",
+        "someone",
+        "anyone",
+        "everyone",
+    }
+)
+
+# Longest first — strip conversational wrappers from the start of the string only.
+_NATURAL_MAIL_PREFIXES = (
+    "is there any mail from ",
+    "is there any email from ",
+    "is there any emails from ",
+    "is there any messages from ",
+    "are there any emails from ",
+    "are there any messages from ",
+    "do i have any mail from ",
+    "do i have any emails from ",
+    "do i have any messages from ",
+    "did i get any mail from ",
+    "did i get any emails from ",
+    "can you find any mail from ",
+    "can you find emails from ",
+    "please find emails from ",
+    "show me emails from ",
+    "show me mail from ",
+    "show emails from ",
+    "find emails from ",
+    "find mail from ",
+    "search for emails from ",
+    "search my mail for ",
+    "is there mail from ",
+    "is there email from ",
+    "are there emails from ",
+    "any mail from ",
+    "any email from ",
+    "any emails from ",
+    "any messages from ",
+    "got mail from ",
+    "got any mail from ",
+    "anything from ",
+)
+
+# For "... from <sender>" — longest match wins. Uses plain string find, not regex.
+_SENDER_IN_QUERY_MARKERS = (
+    " mail from ",
+    " email from ",
+    " emails from ",
+    " messages from ",
+    " message from ",
+    " anything from ",
+)
+
+
+def _strip_natural_mail_query(q: str) -> str:
+    s = q.strip().rstrip("?!.").strip()
+    low = s.lower()
+    for _ in range(12):
+        hit = False
+        for p in sorted(_NATURAL_MAIL_PREFIXES, key=len, reverse=True):
+            if low.startswith(p):
+                s = s[len(p) :].strip().rstrip("?!.").strip()
+                low = s.lower()
+                hit = True
+                break
+        if not hit:
+            break
+    return s
+
+
+def _sender_hint_from_natural_query(s: str) -> Optional[str]:
+    low = s.lower()
+    for m in sorted(_SENDER_IN_QUERY_MARKERS, key=len, reverse=True):
+        if m not in low:
+            continue
+        idx = low.rfind(m)
+        hint = s[idx + len(m) :].strip().rstrip("?!.").strip()
+        if not hint:
+            continue
+        hlow = hint.lower()
+        for sep in (" about ", " regarding ", " related to ", " titled ", " with subject "):
+            j = hlow.find(sep)
+            if j != -1:
+                hint = hint[:j].strip()
+                hlow = hint.lower()
+        if hint and hint.lower() not in _BOGUS_SENDER_HINTS and len(hint) <= 120:
+            return hint
+    if low.startswith("from "):
+        hint = s[5:].strip().rstrip("?!.").strip()
+        if hint and hint.lower() not in _BOGUS_SENDER_HINTS and len(hint) <= 120:
+            return hint
+    return None
+
+
+def _sender_intent_in_question(raw: str) -> bool:
+    low = raw.lower()
+    if low.startswith("from "):
+        return True
+    keys = (
+        "mail from",
+        "email from",
+        "emails from",
+        "messages from",
+        "message from",
+        "anything from",
+    )
+    return any(k in low for k in keys)
+
+
+# Graph /me/messages $search requires the KQL expression to be wrapped in double quotes
+# (otherwise ':' is rejected as invalid syntax). See Microsoft Graph $search docs / SO #79766312.
+GRAPH_MESSAGE_SEARCH_SELECT = "id,subject,from,receivedDateTime,isRead,bodyPreview"
+
+
+def _graph_search_from_sender_kql(term: str) -> Optional[str]:
+    """Build a valid $search string for sender-scoped KQL, or None to skip (e.g. display names with spaces)."""
+    t = (term or "").strip().replace('"', "")
+    if not t:
+        return None
+    if " " in t:
+        return None
+    return f'"from:{t}"'
 
 
 @dataclass
@@ -55,6 +226,7 @@ class OutlookGraphClient:
         self._retry = retry
         self._session = session or requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
+        self._me_cache: Optional[Dict[str, Any]] = None
 
         self._cache = SerializableTokenCache()
         if os.path.exists(auth.token_cache_path):
@@ -93,6 +265,21 @@ class OutlookGraphClient:
     # Compatibility with prompt naming
     def get_access_token(self) -> str:
         return self.acquire_token()
+
+    def get_me(self) -> Dict[str, Any]:
+        if self._me_cache is None:
+            self._me_cache = self._request(
+                "GET",
+                "/me",
+                params={"$select": "id,displayName,mail,userPrincipalName"},
+            )
+        return dict(self._me_cache)
+
+    def _effective_sender_email(self) -> Optional[str]:
+        me = self.get_me()
+        graph_email = (me.get("mail") or me.get("userPrincipalName") or "").strip()
+        configured_email = (self._auth.sender_email or "").strip()
+        return graph_email or configured_email or None
 
     def _request(
         self,
@@ -185,6 +372,7 @@ class OutlookGraphClient:
         select: str,
         orderby: str,
         filter_expr: Optional[str] = None,
+        folder_path: str = "/me/mailFolders/inbox/messages",
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {"$top": page_size, "$select": select, "$orderby": orderby}
         if filter_expr:
@@ -196,9 +384,9 @@ class OutlookGraphClient:
             else:
                 # Graph uses $skiptoken in nextLink; accept raw token or skip.
                 params["$skiptoken"] = next_token
-                data = self._request("GET", "/me/messages", params=params)
+                data = self._request("GET", folder_path, params=params)
         else:
-            data = self._request("GET", "/me/messages", params=params)
+            data = self._request("GET", folder_path, params=params)
 
         emails = list(data.get("value", []))
         GLOBAL_CONTEXT.set_last_email_list(emails)
@@ -239,13 +427,85 @@ class OutlookGraphClient:
         )
 
     def outlook_get_flagged_emails(self, *, page_size: int = 20, next_token: Optional[str] = None) -> Dict[str, Any]:
-        return self._paged_messages(
-            page_size=page_size,
-            next_token=next_token,
-            select="id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview",
-            orderby="receivedDateTime desc",
-            filter_expr="flag/flagStatus eq 'flagged'",
-        )
+        """
+        Flagged / follow-up messages. Do not use `$filter` on `flag/flagStatus` — Graph often
+        rejects it (InefficientFilter / unsupported property). Fetch pages with `flag` selected
+        and filter in memory instead.
+        """
+        select = "id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview,flag"
+        flagged: List[Dict[str, Any]] = []
+        inbox_token: Optional[str] = next_token
+        last_batch: Dict[str, Any] = {}
+        batch_size = min(50, max(page_size, 10))
+        max_batches = 40  # up to ~2000 recent messages scanned
+
+        for _ in range(max_batches):
+            if len(flagged) >= page_size:
+                break
+            last_batch = self._paged_messages(
+                page_size=batch_size,
+                next_token=inbox_token,
+                select=select,
+                orderby="receivedDateTime desc",
+                filter_expr=None,
+            )
+            for m in last_batch.get("emails", []):
+                status = (m.get("flag") or {}).get("flagStatus")
+                if status == "flagged":
+                    flagged.append(m)
+                    if len(flagged) >= page_size:
+                        break
+            inbox_token = last_batch.get("next_token")
+            if not inbox_token:
+                break
+
+        out = flagged[:page_size]
+        GLOBAL_CONTEXT.set_last_email_list(out)
+        return {
+            "emails": out,
+            "next_token": inbox_token,
+            "next_link": last_batch.get("next_link"),
+        }
+
+    def _message_search_keyword(
+        self,
+        query: str,
+        *,
+        top: int,
+        select: str,
+    ) -> List[Dict[str, Any]]:
+        """Microsoft Graph $search for topical / keyword discovery (subject, body, participants, etc.)."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        merged: Dict[str, Dict[str, Any]] = {}
+        hdrs = {"ConsistencyLevel": "eventual"}
+        # Narrow select reduces incompatibility with $search on some tenants.
+        search_select = GRAPH_MESSAGE_SEARCH_SELECT
+
+        def _pull(search_param: str) -> None:
+            try:
+                data = self._request(
+                    "GET",
+                    "/me/messages",
+                    params={"$search": search_param, "$top": top, "$select": search_select},
+                    headers=hdrs,
+                )
+            except OutlookError:
+                return
+            for m in data.get("value", []):
+                mid = m.get("id")
+                if mid:
+                    merged[mid] = m
+
+        if '"' in q or ":" in q:
+            _pull(q)
+        else:
+            _pull(f'"{q}"')
+            sparse = len(merged) < min(8, max(3, top // 2))
+            if sparse and len(q.split()) >= 2:
+                _pull(q)
+        return list(merged.values())[:top]
 
     def outlook_search_emails(
         self,
@@ -254,27 +514,128 @@ class OutlookGraphClient:
         top: int = 10,
         select: str = "id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview",
     ) -> List[Dict[str, Any]]:
-        # Graph supports $search with special header.
-        data = self._request(
-            "GET",
-            "/me/messages",
-            params={"$search": f"\"{query}\"", "$top": top, "$select": select},
-            headers={"ConsistencyLevel": "eventual"},
-        )
-        return list(data.get("value", []))
+        safe = _sanitize_mail_search_term(query)
+        return self._message_search_keyword(safe, top=top, select=select)
+
+    def outlook_find_messages(
+        self,
+        query: str,
+        *,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Single entry point for natural-language discovery: sender-style questions
+        (… mail from …), topic/keyword search, or mixed wording. Chooses Graph paths
+        without requiring the caller to pick a separate tool.
+        """
+        raw = (query or "").strip()
+        if not raw:
+            raise EmailValidationError("Search query cannot be empty.")
+        top = min(50, max(page_size, 5))
+        select = "id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview"
+
+        hint = _sender_hint_from_natural_query(raw)
+        if hint:
+            out = self.outlook_filter_emails_by_sender(hint, page_size=page_size)
+            out["search_kind"] = "sender"
+            out["resolved_hint"] = hint
+            return out
+
+        stripped = _strip_natural_mail_query(raw)
+        q = stripped if stripped else raw.rstrip("?!.").strip()
+        if not q:
+            q = raw
+
+        if _sender_intent_in_question(raw) and q.lower() not in _BOGUS_SENDER_HINTS and len(q) <= 120:
+            if len(q.split()) <= 8:
+                out = self.outlook_filter_emails_by_sender(q, page_size=page_size)
+                out["search_kind"] = "sender"
+                out["resolved_hint"] = q
+                return out
+
+        emails = self._message_search_keyword(_sanitize_mail_search_term(q), top=top, select=select)
+        GLOBAL_CONTEXT.set_last_email_list(emails)
+        return {
+            "emails": emails,
+            "next_token": None,
+            "next_link": None,
+            "search_kind": "keyword",
+            "query": q,
+        }
 
     def outlook_filter_emails_by_sender(self, sender: str, *, page_size: int = 20, next_token: Optional[str] = None) -> Dict[str, Any]:
-        sender = validate_email_address(sender)
-        # from/emailAddress/address isn't filterable in all tenants; use substring match on from.
-        # Keep conservative: use contains() on from/emailAddress/address when supported.
-        filter_expr = f"from/emailAddress/address eq '{sender}'"
-        return self._paged_messages(
-            page_size=page_size,
-            next_token=next_token,
-            select="id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview",
-            orderby="receivedDateTime desc",
-            filter_expr=filter_expr,
-        )
+        """
+        Find messages whose From address or display name matches a hint (company, domain,
+        partial address, or full email). Uses Graph $search plus inbox scans — no strict
+        RFC email format required on the hint.
+        """
+        term = _sanitize_mail_search_term(sender)
+        top_fetch = min(50, max(page_size, 15))
+        select = "id,subject,from,receivedDateTime,isRead,hasAttachments,importance,bodyPreview"
+        search_select = GRAPH_MESSAGE_SEARCH_SELECT
+
+        def _search(kql: str) -> List[Dict[str, Any]]:
+            try:
+                data = self._request(
+                    "GET",
+                    "/me/messages",
+                    params={"$search": kql, "$top": top_fetch, "$select": search_select},
+                    headers={"ConsistencyLevel": "eventual"},
+                )
+            except OutlookError:
+                return []
+            return list(data.get("value", []))
+
+        # 1) Sender-scoped KQL — entire expression must be quoted for Graph (e.g. "from:amazon").
+        emails: List[Dict[str, Any]] = []
+        kql_from = _graph_search_from_sender_kql(term)
+        if kql_from:
+            emails = _search(kql_from)
+        emails = [m for m in emails if _message_from_matches(m, term)][:page_size]
+
+        # 2) Phrase search across mail, then keep only messages where From matches hint
+        if len(emails) < page_size:
+            broad = _search(f'"{term}"')
+            merged: Dict[str, Dict[str, Any]] = {m["id"]: m for m in emails if m.get("id")}
+            for m in broad:
+                mid = m.get("id")
+                if not mid or mid in merged:
+                    continue
+                if _message_from_matches(m, term):
+                    merged[mid] = m
+                    if len(merged) >= page_size:
+                        break
+            emails = list(merged.values())[:page_size]
+
+        # 3) Scan recent inbox pages (no strict filter) — catches senders KQL missed
+        if len(emails) < page_size:
+            merged = {m["id"]: m for m in emails if m.get("id")}
+            inbox_token: Optional[str] = None
+            for _ in range(8):
+                batch = self._paged_messages(
+                    page_size=50,
+                    next_token=inbox_token,
+                    select=select,
+                    orderby="receivedDateTime desc",
+                    filter_expr=None,
+                )
+                for m in batch.get("emails", []):
+                    mid = m.get("id")
+                    if not mid or mid in merged:
+                        continue
+                    if _message_from_matches(m, term):
+                        merged[mid] = m
+                        if len(merged) >= page_size:
+                            break
+                if len(merged) >= page_size:
+                    break
+                inbox_token = batch.get("next_token")
+                if not inbox_token:
+                    break
+            emails = list(merged.values())[:page_size]
+
+        GLOBAL_CONTEXT.set_last_email_list(emails)
+        return {"emails": emails, "next_token": None, "next_link": None}
 
     def outlook_filter_emails_by_date(
         self,
@@ -316,8 +677,9 @@ class OutlookGraphClient:
             "body": {"contentType": content_type, "content": body},
             "toRecipients": to_recipients,
         }
-        if self._auth.sender_email:
-            msg["from"] = {"emailAddress": {"address": self._auth.sender_email}}
+        sender_email = self._effective_sender_email()
+        if sender_email:
+            msg["from"] = {"emailAddress": {"address": sender_email}}
         if cc_recipients:
             msg["ccRecipients"] = cc_recipients
         if bcc_recipients:
@@ -340,17 +702,82 @@ class OutlookGraphClient:
             "body": {"contentType": content_type, "content": body},
             "toRecipients": to_recipients,
         }
-        if self._auth.sender_email:
-            draft_body["from"] = {"emailAddress": {"address": self._auth.sender_email}}
+        sender_email = self._effective_sender_email()
+        if sender_email:
+            draft_body["from"] = {"emailAddress": {"address": sender_email}}
         draft = self._request(
             "POST",
             "/me/messages",
             json=draft_body,
         )
-        return draft
+        # Promote draft_id to the top level so the model can extract it unambiguously.
+        return {
+            "draft_id": draft.get("id", ""),
+            "subject": draft.get("subject", subject),
+            "to": to,
+            "from": sender_email,
+            "status": "saved_to_drafts",
+        }
 
-    def outlook_send_draft(self, draft_id: str) -> None:
-        self._request("POST", f"/me/messages/{draft_id}/send")
+    def outlook_send_draft(self, draft_id: str) -> Dict[str, Any]:
+        """
+        Send a saved draft by ID.
+
+        Note: Graph message IDs often contain characters that MUST be URL-encoded when used
+        in a path segment. Without encoding, Graph can respond with "Id is malformed" or 404.
+        """
+        clean_id = (draft_id or "").strip()
+        if not clean_id:
+            raise OutlookError("draft_id is required to send a draft.")
+
+        # Capture immutable identifiers before sending (best-effort).
+        meta: Dict[str, Any] = {}
+        try:
+            meta = self._request(
+                "GET",
+                f"/me/messages/{quote(clean_id, safe='')}",
+                params={"$select": "id,subject,internetMessageId"},
+            )
+        except Exception:
+            meta = {}
+
+        self._request("POST", f"/me/messages/{quote(clean_id, safe='')}/send")
+
+        # Best-effort verification: try to find the message in Sent Items by internetMessageId.
+        verified = False
+        sent_id: Optional[str] = None
+        internet_mid = meta.get("internetMessageId")
+        if isinstance(internet_mid, str) and internet_mid.strip():
+            # Give Graph a moment to move the message.
+            time.sleep(2.0)
+            try:
+                # Escape single quotes for OData.
+                mid_escaped = internet_mid.replace("'", "''")
+                data = self._request(
+                    "GET",
+                    "/me/mailFolders/sentitems/messages",
+                    params={
+                        "$top": 5,
+                        "$select": "id,subject,from,receivedDateTime,internetMessageId",
+                        "$filter": f"internetMessageId eq '{mid_escaped}'",
+                        "$orderby": "receivedDateTime desc",
+                    },
+                )
+                items = list(data.get("value", []))
+                if items:
+                    verified = True
+                    sent_id = str(items[0].get("id") or "")
+            except Exception:
+                pass
+
+        return {
+            "sent": True,
+            "verified": verified,
+            "draft_id": clean_id,
+            "sent_message_id": sent_id,
+            "internetMessageId": internet_mid,
+            "subject": meta.get("subject"),
+        }
 
     def outlook_update_draft(self, draft_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         # Expect Graph message patch payload; caller provides safe subset.
