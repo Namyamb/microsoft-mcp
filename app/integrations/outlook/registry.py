@@ -25,6 +25,7 @@ from .ai import (
     sentiment_analysis,
     summarize_email,
     summarize_emails,
+    summarize_mailbox,
     auto_categorize_emails,
     auto_archive_promotions,
     auto_reply_rules,
@@ -71,6 +72,7 @@ def get_outlook_tools(
         "outlook_get_flagged_emails": core.outlook_get_flagged_emails,
         "outlook_search_emails": core.outlook_search_emails,
         "outlook_filter_emails_by_sender": core.outlook_filter_emails_by_sender,
+        "outlook_find_messages": core.outlook_find_messages,
         "outlook_filter_emails_by_date": core.outlook_filter_emails_by_date,
         "outlook_send_email": core.outlook_send_email,
         "outlook_create_draft": core.outlook_create_draft,
@@ -113,6 +115,9 @@ def get_outlook_tools(
         # AI tools
         "summarize_email": lambda *, subject, sender, preview: summarize_email(
             llm, subject=subject, sender=sender, preview=preview
+        ),
+        "summarize_mailbox": lambda *, query, max_emails=15, email_id=None: summarize_mailbox(
+            llm, core, query=query, max_emails=max_emails, email_id=email_id
         ),
         "classify_email": lambda *, subject, preview: classify_email(llm, subject=subject, preview=preview),
         "detect_urgency": lambda *, subject, preview: detect_urgency(llm, subject=subject, preview=preview),

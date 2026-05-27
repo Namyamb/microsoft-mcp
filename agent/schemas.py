@@ -77,42 +77,30 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "outlook_search_emails",
-            "description": "Search emails by keyword. Searches subject, body, and sender.",
+            "name": "outlook_find_messages",
+            "description": (
+                "Primary tool whenever the user wants to find, search, or check whether mail exists — "
+                "by sender (any phrasing like mail/email/messages from a person, company, domain, or address), "
+                "by topic or keywords in subject/body, or casual questions in full sentences. "
+                "Pass the user's wording or the distilled search phrase; do not split into a separate "
+                "sender tool vs keyword tool — this one routes appropriately."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search keyword or phrase.",
-                    },
-                    "top": {
-                        "type": "integer",
-                        "description": "Max number of results (default 10).",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "outlook_filter_emails_by_sender",
-            "description": "Get emails from a specific sender email address.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sender": {
-                        "type": "string",
-                        "description": "The sender's email address.",
+                        "description": (
+                            "Natural question or search text, e.g. full sentence asking if mail exists from someone, "
+                            "or keywords like project name, invoice, flight confirmation."
+                        ),
                     },
                     "page_size": {
                         "type": "integer",
-                        "description": "Number of emails to return (default 10).",
+                        "description": "Max messages to return (default 15, cap 50).",
                     },
                 },
-                "required": ["sender"],
+                "required": ["query"],
             },
         },
     },
@@ -146,7 +134,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "outlook_send_email",
-            "description": "Send a new email. Always confirm with the user before calling this.",
+            "description": "Send a new email immediately and permanently. WARNING: ONLY call this tool when the user uses the word 'send'. If the user says 'draft', 'create a draft', or anything other than 'send', you MUST use outlook_create_draft instead. Do NOT call this tool for drafts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -176,7 +164,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "outlook_create_draft",
-            "description": "Create a draft email without sending it.",
+            "description": (
+                "Create a draft email and save it to the Drafts folder WITHOUT sending it. "
+                "Always use this tool when the user says 'draft', 'create a draft', 'save as draft', "
+                "or does not explicitly say 'send'. "
+                "Returns {\"success\": true, \"data\": {\"draft_id\": \"...\", \"subject\": \"...\", \"status\": \"saved_to_drafts\"}}. "
+                "CRITICAL: remember the value of data.draft_id — pass it exactly to outlook_send_draft when the user asks to send."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -189,6 +183,28 @@ TOOL_SCHEMAS = [
                     "body": {"type": "string", "description": "Email body (plain text)."},
                 },
                 "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "outlook_send_draft",
+            "description": (
+                "Send an already-saved draft by its id. "
+                "Use this — NOT outlook_send_email — whenever the user says 'send it', 'send the draft', "
+                "'go ahead and send', or any similar phrasing AFTER a draft has already been created. "
+                "The draft_id comes from the 'id' field returned by outlook_create_draft."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {
+                        "type": "string",
+                        "description": "The draft_id from data.draft_id returned by outlook_create_draft. Pass it exactly as-is.",
+                    },
+                },
+                "required": ["draft_id"],
             },
         },
     },
@@ -380,16 +396,33 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "summarize_email",
-            "description": "Use AI to summarize an email into 2-4 bullet points.",
+            "name": "summarize_mailbox",
+            "description": (
+                "Use AI to answer any natural-language request about summarizing or briefing on mail: "
+                "recent inbox, unread, flagged, mail from a person or company, topics or keywords, "
+                "or a single message if you have its id. Pass the user's request as-is; this tool fetches "
+                "the right messages and summarizes — you do not need subject/sender/preview fields."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subject": {"type": "string", "description": "Email subject."},
-                    "sender": {"type": "string", "description": "Sender name or address."},
-                    "preview": {"type": "string", "description": "Email body preview or full text."},
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What the user wants, in their own words (e.g. summarize unread, "
+                            "what's important today, recap mail from finance, overview of last week)."
+                        ),
+                    },
+                    "max_emails": {
+                        "type": "integer",
+                        "description": "How many messages to load at most (default 15, max 25).",
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "Optional. If set, summarize only this message id (Graph id).",
+                    },
                 },
-                "required": ["subject", "sender", "preview"],
+                "required": ["query"],
             },
         },
     },

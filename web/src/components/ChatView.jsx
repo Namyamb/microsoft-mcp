@@ -8,13 +8,22 @@ const SUGGESTIONS = [
   "Search emails about 'meeting'",
 ]
 
+function stripLegacyStoppedSuffix(content) {
+  if (!content || typeof content !== 'string') return content
+  let s = content.trimEnd()
+  s = s.replace(/\n\n_\(\s*Generation stopped\.?\s*\)_\s*$/i, '')
+  s = s.replace(/_\(\s*Generation stopped\.?\s*\)_\s*$/i, '')
+  return s
+}
+
 function buildDisplayMessages(apiMessages) {
   return apiMessages.map(m => ({
     id: m.id,
     role: m.role,
-    content: m.content,
+    content: stripLegacyStoppedSuffix(m.content),
     toolCalls: m.tool_calls || [],
     streaming: false,
+    stopped: false,
   }))
 }
 
@@ -25,6 +34,7 @@ export default function ChatView({ sessionId, onSessionTitleUpdate, theme, onTog
   const [loading, setLoading] = useState(true)
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
+  const abortRef = useRef(null)
 
   // Load messages from DB when session changes
   useEffect(() => {
@@ -59,14 +69,18 @@ export default function ChatView({ sessionId, onSessionTitleUpdate, theme, onTog
     setMessages(prev => [
       ...prev,
       { id: userMsgId, role: 'user', content: trimmed, toolCalls: [], streaming: false },
-      { id: assistantId, role: 'assistant', content: '', toolCalls: [], streaming: true },
+      { id: assistantId, role: 'assistant', content: '', toolCalls: [], streaming: true, stopped: false },
     ])
+
+    const ac = new AbortController()
+    abortRef.current = ac
 
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, message: trimmed }),
+        signal: ac.signal,
       })
 
       if (!res.ok) throw new Error(`Server error ${res.status}`)
@@ -128,7 +142,12 @@ export default function ChatView({ sessionId, onSessionTitleUpdate, theme, onTog
       onSessionTitleUpdate?.()
 
     } catch (e) {
-      if (e.name !== 'AbortError') {
+      if (e.name === 'AbortError') {
+        setMessages(prev => prev.map(m => {
+          if (m.id !== assistantId) return m
+          return { ...m, streaming: false, stopped: true }
+        }))
+      } else {
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, content: `⚠️ Connection error: ${e.message}`, streaming: false }
@@ -136,10 +155,15 @@ export default function ChatView({ sessionId, onSessionTitleUpdate, theme, onTog
         ))
       }
     } finally {
+      abortRef.current = null
       setIsStreaming(false)
       inputRef.current?.focus()
     }
   }, [input, isStreaming, sessionId, onSessionTitleUpdate])
+
+  const stopGeneration = useCallback(() => {
+    abortRef.current?.abort()
+  }, [])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
@@ -213,19 +237,30 @@ export default function ChatView({ sessionId, onSessionTitleUpdate, theme, onTog
             rows={1}
             disabled={isStreaming}
           />
-          <button
-            className="send-btn"
-            onClick={() => sendMessage()}
-            disabled={!input.trim() || isStreaming}
-          >
-            {isStreaming ? <span className="send-spinner" /> : (
+          {isStreaming ? (
+            <button
+              type="button"
+              className="stop-btn"
+              onClick={stopGeneration}
+              title="Stop generating"
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              className="send-btn"
+              onClick={() => sendMessage()}
+              disabled={!input.trim()}
+            >
               <svg viewBox="0 0 20 20" fill="currentColor">
                 <path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" />
               </svg>
-            )}
-          </button>
+            </button>
+          )}
         </div>
-        <p className="input-hint">Enter to send · Shift+Enter for new line</p>
+        <p className="input-hint">
+          {isStreaming ? 'Stop anytime · generating…' : 'Enter to send · Shift+Enter for new line'}
+        </p>
       </footer>
     </div>
   )

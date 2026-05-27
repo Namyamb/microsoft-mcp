@@ -57,11 +57,7 @@ export default function Sidebar({ activeId, onSelect, onNew, collapsed, onToggle
     setEditId(null)
   }
 
-  const handleNew = async () => {
-    const res = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'New Chat' }) })
-    const session = await res.json()
-    setSessions(s => [session, ...s])
-    onSelect(session.id)
+  const handleNew = () => {
     onNew && onNew()
   }
 

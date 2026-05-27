@@ -37,13 +37,36 @@ class OutlookGraphClientV2:
         ref = (reference or "").strip().lower()
         ctx = GLOBAL_CONTEXT.get()
 
-        if ref in ("this email", "that email", "that one", "this one", "current email"):
+        # Check context-pointer phrases BEFORE any stripping
+        if ref in ("this", "that", "it", "this email", "that email", "this one",
+                   "that one", "current email", "current", "the email"):
             if ctx.last_viewed_ids:
                 return {"id": ctx.last_viewed_ids[0], "chosen": {"id": ctx.last_viewed_ids[0]}, "candidates": []}
-            raise EmailNotFoundError("No 'current email' in context. View an email first.")
+            raise EmailNotFoundError("No current email in context. View an email first.")
+
+        # Strip filler words so "the first email", "first one", "#1" etc. all resolve correctly
+        ref = re.sub(r"\b(the|an?|that|this)\b", "", ref).strip()
+        ref = re.sub(r"\b(email|message|mail|one|item)\b", "", ref).strip()
+        ref = re.sub(r"\s+", " ", ref).strip()
+
+        # numeric shorthand: "1", "2", "#1", "number 1"
+        num_match = re.fullmatch(r"#?(\d+)", ref) or re.fullmatch(r"number\s*(\d+)", ref)
+        if num_match:
+            idx = int(num_match.group(1)) - 1
+            if 0 <= idx < len(ctx.last_email_list):
+                chosen = ctx.last_email_list[idx]
+                return {"id": str(chosen["id"]), "chosen": chosen, "candidates": ctx.last_email_list}
+            raise EmailNotFoundError(f"No email at position {idx + 1} in the last list.")
 
         # ordinal references based on last list
-        ord_map = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+        ord_map = {
+            "first": 1, "1st": 1,
+            "second": 2, "2nd": 2,
+            "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4,
+            "fifth": 5, "5th": 5,
+            "sixth": 6, "6th": 6,
+        }
         if ref in ord_map:
             idx = ord_map[ref] - 1
             if 0 <= idx < len(ctx.last_email_list):

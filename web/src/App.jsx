@@ -68,7 +68,7 @@ export default function App() {
     const s = await res.json()
     setActiveSessionId(s.id)
     localStorage.setItem('active_session_id', s.id)
-    Sidebar.refresh?.()
+    await Sidebar.refresh?.()
   }
 
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')

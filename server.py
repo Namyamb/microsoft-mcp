@@ -25,6 +25,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -35,7 +36,7 @@ except ImportError:
     pass
 
 import db
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -101,6 +102,36 @@ def _is_authenticated() -> bool:
         return _auth_state["status"] == "completed"
 
 
+def _clear_auth_state() -> None:
+    global _graph_client
+    # Reset MSAL cache (in-memory + file) and drop the singleton client so
+    # the next request forces a fresh device-code flow.
+    with _graph_lock:
+        client = _graph_client
+        _graph_client = None
+
+    if client is not None:
+        try:
+            client._app.token_cache.clear()
+        except Exception:
+            pass
+        try:
+            client._save_cache()
+        except Exception:
+            pass
+
+        try:
+            cache_path = (client._auth.token_cache_path or "").strip()
+            if cache_path:
+                Path(cache_path).expanduser().unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    with _auth_lock:
+        _auth_state["status"] = "idle"
+        _auth_state["error"] = None
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "2.0.0"}
@@ -154,6 +185,12 @@ def auth_start():
         "expires_in": flow.get("expires_in", 900),
         "message": flow.get("message", ""),
     }
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    _clear_auth_state()
+    return {"ok": True}
 
 
 @app.get("/api/auth/poll")
@@ -213,7 +250,7 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, req: Request):
     if not _is_authenticated():
         async def _unauth():
             yield f"data: {json.dumps({'type': 'error', 'message': 'Not signed in.'})}\n\n"
@@ -244,10 +281,11 @@ async def chat(request: ChatRequest):
         loop = asyncio.get_event_loop()
         full_content: List[str] = []
         full_tool_calls: List[Any] = []
+        assistant_saved = False
 
         def _worker():
             try:
-                for event in run_agent_stream(history, request.message):
+                for event in run_agent_stream(history, request.message, session_id=request.session_id):
                     if event["type"] == "text_delta":
                         full_content.append(event["content"])
                     elif event["type"] in ("tool_start", "tool_end"):
@@ -260,11 +298,33 @@ async def chat(request: ChatRequest):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+        poll_s = 0.25
         while True:
-            event = await q.get()
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=poll_s)
+            except asyncio.TimeoutError:
+                if await req.is_disconnected():
+                    content = "".join(full_content)
+                    if (content.strip() or full_tool_calls) and not assistant_saved:
+                        db.add_message(
+                            request.session_id,
+                            "assistant",
+                            content,
+                            tool_calls=full_tool_calls or None,
+                        )
+                        assistant_saved = True
+                        logger.info(
+                            "chat client disconnected mid-stream; saved partial assistant message session=%s",
+                            request.session_id[:8],
+                        )
+                    return
+                continue
+
             if event is None:
-                content = "".join(full_content)
-                db.add_message(request.session_id, "assistant", content, tool_calls=full_tool_calls or None)
+                if not assistant_saved:
+                    content = "".join(full_content)
+                    db.add_message(request.session_id, "assistant", content, tool_calls=full_tool_calls or None)
+                    assistant_saved = True
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 break
             yield f"data: {json.dumps(event, default=str, ensure_ascii=False)}\n\n"
@@ -288,31 +348,32 @@ class EmailActionRequest(BaseModel):
 def email_action(body: EmailActionRequest):
     if not _is_authenticated():
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    _ACTION_TOOL_MAP = {
+        "archive":      "outlook_archive_email",
+        "flag":         "outlook_flag_email",
+        "unflag":       "outlook_unflag_email",
+        "mark_read":    "outlook_mark_as_read",
+        "mark_unread":  "outlook_mark_as_unread",
+        "delete":       "outlook_delete_email",
+    }
+
+    if body.action not in _ACTION_TOOL_MAP:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {body.action!r}")
+
     try:
-        client = _get_graph_client()
-        action = body.action
-        eid = body.email_id
-
-        if action == "archive":
-            result = client.outlook_archive_email(eid)
-        elif action == "flag":
-            result = client.outlook_flag_email(eid)
-        elif action == "unflag":
-            result = client.outlook_unflag_email(eid)
-        elif action == "mark_read":
-            result = client.outlook_mark_as_read(eid)
-        elif action == "mark_unread":
-            result = client.outlook_mark_as_unread(eid)
-        elif action == "delete":
-            client.outlook_delete_email(eid)
-            result = {}
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
-
+        from agent.loop import _get_tools
+        tools = _get_tools()
+        tool_name = _ACTION_TOOL_MAP[body.action]
+        fn = tools.get(tool_name)
+        if fn is None:
+            raise HTTPException(status_code=500, detail=f"Tool {tool_name!r} not found in registry")
+        result = fn(email_id=body.email_id)
         return {"success": True, "data": result}
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("email_action failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -408,4 +469,5 @@ if os.path.isdir(_dist):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=True)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
